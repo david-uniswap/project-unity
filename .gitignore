@@ -1,0 +1,18 @@
+# Environment
+.env
+
+# Node / Bun
+node_modules/
+bun.lockb
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Indexer artifacts
+indexer/artifacts/
+
+# OS
+.DS_Store
+*.log
