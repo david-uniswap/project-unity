@@ -142,7 +142,8 @@ export function extractProofsForAllProfiles(
 
     results.push({
       profile,
-      aura: auraSnapshot.aura,
+      // Use the aura already encoded in the leaf (UNI-derived + permanent bonuses).
+      aura: leaf.aura,
       repByCategory: {
         research: repTotals.research,
         builder: repTotals.builder,
@@ -157,6 +158,26 @@ export function extractProofsForAllProfiles(
   }
 
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Tree serialization (for local storage and offline proof generation)
+// ---------------------------------------------------------------------------
+
+/**
+ * Serialize the full Merkle tree structure so it can be saved to disk and
+ * reloaded offline with StandardMerkleTree.load(dump).
+ *
+ * The resulting object can be used by anyone (including frontend devs) to
+ * generate their own proofs without hitting the API:
+ *
+ *   import { StandardMerkleTree } from "@openzeppelin/merkle-tree"
+ *   const dump = JSON.parse(fs.readFileSync("merkle-epoch-1.json"))
+ *   const tree = StandardMerkleTree.load(dump)
+ *   const proof = tree.getProof([epoch, wallet, ...])
+ */
+export function dumpMerkleTree(output: MerkleOutput): ReturnType<typeof output.tree.dump> {
+  return output.tree.dump();
 }
 
 // ---------------------------------------------------------------------------

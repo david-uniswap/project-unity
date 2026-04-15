@@ -4,30 +4,55 @@
  * Reads:
  *  - ProfileRegistry events (NameRegistered, WalletLinked, WalletUnlinked)
  *  - RepEmitter events (RepGiven)
+ *  - ChallengeRegistry events (ChallengeSubmitted, ChallengeAccepted, ChallengeRejected, AuraBountyGranted)
  *  - FakeUNI balances for individual wallets
  *  - LP pool token reserves for approved LP contracts (V2-style)
  */
 
-import { createPublicClient, createWalletClient, http, parseAbi, getAddress } from "viem";
-import { sepolia } from "viem/chains";
+import { createPublicClient, createWalletClient, http, parseAbi, defineChain } from "viem";
+import { sepolia, anvil } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   RPC_URL,
+  CHAIN_ID,
   FAKE_UNI_ADDRESS,
   PROFILE_REGISTRY_ADDRESS,
   REP_EMITTER_ADDRESS,
   ROOT_REGISTRY_ADDRESS,
+  CHALLENGE_REGISTRY_ADDRESS,
   APPROVED_LP_POOLS,
   POSTER_PRIVATE_KEY,
 } from "./config.ts";
-import type { RepEvent } from "./types.ts";
+
+// ---------------------------------------------------------------------------
+// Chain resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the viem chain object from CHAIN_ID.
+ * Supports Sepolia (11155111), local Anvil (31337), and any other chain
+ * via a minimal custom definition.
+ */
+function resolveChain() {
+  if (CHAIN_ID === 11155111) return sepolia;
+  if (CHAIN_ID === 31337) return anvil;
+  return defineChain({
+    id: CHAIN_ID,
+    name: `Chain ${CHAIN_ID}`,
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+    rpcUrls: { default: { http: [RPC_URL] } },
+  });
+}
+
+const chain = resolveChain();
+import type { RepEvent, Challenge, AuraBonus } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
 
 export const publicClient = createPublicClient({
-  chain: sepolia,
+  chain,
   transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
 });
 
@@ -35,7 +60,7 @@ const posterAccount = privateKeyToAccount(POSTER_PRIVATE_KEY);
 
 export const walletClient = createWalletClient({
   account: posterAccount,
-  chain: sepolia,
+  chain,
   transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
 });
 
@@ -67,8 +92,15 @@ const REP_EMITTER_ABI = parseAbi([
 ]);
 
 const ROOT_REGISTRY_ABI = parseAbi([
-  "function postRoot(uint256 epoch, bytes32 root) external",
+  "function postRoot(uint256 epoch, bytes32 root, bytes32 datasetHash) external",
   "function currentEpoch() view returns (uint256)",
+]);
+
+const CHALLENGE_REGISTRY_ABI = parseAbi([
+  "event ChallengeSubmitted(uint256 indexed challengeId, address indexed challenger, uint256 indexed epochNumber, bytes32 claimedCorrectRoot, bytes32 evidenceHash)",
+  "event ChallengeAccepted(uint256 indexed challengeId, address indexed challenger, uint256 indexed epochNumber)",
+  "event ChallengeRejected(uint256 indexed challengeId, address indexed challenger, string reason)",
+  "event AuraBountyGranted(address indexed recipient, uint256 amount, uint256 indexed challengeId)",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -76,8 +108,7 @@ const ROOT_REGISTRY_ABI = parseAbi([
 // ---------------------------------------------------------------------------
 
 export async function getCurrentBlock(): Promise<bigint> {
-  const block = await publicClient.getBlockNumber();
-  return block;
+  return publicClient.getBlockNumber();
 }
 
 export async function getBlockTimestamp(blockNumber: bigint): Promise<Date> {
@@ -89,7 +120,7 @@ export async function getBlockTimestamp(blockNumber: bigint): Promise<Date> {
 // Balance reads
 // ---------------------------------------------------------------------------
 
-/** Read the raw fUNI balance for a wallet (wei-scale). */
+/** Read the raw fUNI balance for a wallet (wei-scale, 18 decimals). */
 export async function getFakeUNIBalance(wallet: `0x${string}`): Promise<bigint> {
   return publicClient.readContract({
     address: FAKE_UNI_ADDRESS,
@@ -101,8 +132,7 @@ export async function getFakeUNIBalance(wallet: `0x${string}`): Promise<bigint> 
 
 /**
  * For each approved LP pool (V2-style), compute how much UNI the given wallet holds
- * based on their share of the pool.
- * Returns the raw UNI amount (not 2x boosted — boosting happens in aura.ts).
+ * based on their share of the pool. Returns the raw UNI amount (not 2× boosted).
  */
 export async function getLPUNIBalance(wallet: `0x${string}`): Promise<bigint> {
   if (APPROVED_LP_POOLS.length === 0) return 0n;
@@ -110,10 +140,9 @@ export async function getLPUNIBalance(wallet: `0x${string}`): Promise<bigint> {
   let total = 0n;
   for (const pool of APPROVED_LP_POOLS) {
     try {
-      const [reserves, token0, token1, totalSupply, userBalance] = await Promise.all([
+      const [reserves, token0, totalSupply, userBalance] = await Promise.all([
         publicClient.readContract({ address: pool, abi: V2_PAIR_ABI, functionName: "getReserves" }),
         publicClient.readContract({ address: pool, abi: V2_PAIR_ABI, functionName: "token0" }),
-        publicClient.readContract({ address: pool, abi: V2_PAIR_ABI, functionName: "token1" }),
         publicClient.readContract({ address: pool, abi: V2_PAIR_ABI, functionName: "totalSupply" }),
         publicClient.readContract({
           address: pool,
@@ -125,16 +154,19 @@ export async function getLPUNIBalance(wallet: `0x${string}`): Promise<bigint> {
 
       if (totalSupply === 0n || userBalance === 0n) continue;
 
-      // Which reserve is fUNI?
+      const token1 = await publicClient.readContract({
+        address: pool,
+        abi: V2_PAIR_ABI,
+        functionName: "token1",
+      });
+
       const fakeUniLower = FAKE_UNI_ADDRESS.toLowerCase();
       const uniReserve =
-        token0.toLowerCase() === fakeUniLower ? reserves[0] : reserves[1];
+        (token0 as string).toLowerCase() === fakeUniLower ? reserves[0] : reserves[1];
 
-      // User's share: (userBalance / totalSupply) * uniReserve
       const userUniInPool = (BigInt(userBalance) * BigInt(uniReserve)) / BigInt(totalSupply);
       total += userUniInPool;
     } catch {
-      // Pool read failed — skip it for this epoch rather than breaking the pipeline.
       console.warn(`[blockchain] Failed to read LP pool ${pool} for ${wallet}, skipping`);
     }
   }
@@ -145,23 +177,9 @@ export async function getLPUNIBalance(wallet: `0x${string}`): Promise<bigint> {
 // ProfileRegistry events
 // ---------------------------------------------------------------------------
 
-export type NameRegisteredEvent = {
-  wallet: `0x${string}`;
-  name: string;
-  blockNumber: bigint;
-};
-
-export type WalletLinkedEvent = {
-  primary: `0x${string}`;
-  linked: `0x${string}`;
-  blockNumber: bigint;
-};
-
-export type WalletUnlinkedEvent = {
-  primary: `0x${string}`;
-  linked: `0x${string}`;
-  blockNumber: bigint;
-};
+export type NameRegisteredEvent = { wallet: `0x${string}`; name: string; blockNumber: bigint };
+export type WalletLinkedEvent = { primary: `0x${string}`; linked: `0x${string}`; blockNumber: bigint };
+export type WalletUnlinkedEvent = { primary: `0x${string}`; linked: `0x${string}`; blockNumber: bigint };
 
 export async function getProfileRegistryEvents(
   fromBlock: bigint,
@@ -172,24 +190,9 @@ export async function getProfileRegistryEvents(
   unlinked: WalletUnlinkedEvent[];
 }> {
   const [regLogs, linkLogs, unlinkLogs] = await Promise.all([
-    publicClient.getLogs({
-      address: PROFILE_REGISTRY_ADDRESS,
-      event: PROFILE_REGISTRY_ABI[0],
-      fromBlock,
-      toBlock,
-    }),
-    publicClient.getLogs({
-      address: PROFILE_REGISTRY_ADDRESS,
-      event: PROFILE_REGISTRY_ABI[1],
-      fromBlock,
-      toBlock,
-    }),
-    publicClient.getLogs({
-      address: PROFILE_REGISTRY_ADDRESS,
-      event: PROFILE_REGISTRY_ABI[2],
-      fromBlock,
-      toBlock,
-    }),
+    publicClient.getLogs({ address: PROFILE_REGISTRY_ADDRESS, event: PROFILE_REGISTRY_ABI[0], fromBlock, toBlock }),
+    publicClient.getLogs({ address: PROFILE_REGISTRY_ADDRESS, event: PROFILE_REGISTRY_ABI[1], fromBlock, toBlock }),
+    publicClient.getLogs({ address: PROFILE_REGISTRY_ADDRESS, event: PROFILE_REGISTRY_ABI[2], fromBlock, toBlock }),
   ]);
 
   return {
@@ -215,10 +218,7 @@ export async function getProfileRegistryEvents(
 // RepEmitter events
 // ---------------------------------------------------------------------------
 
-export async function getRepEvents(
-  fromBlock: bigint,
-  toBlock: bigint
-): Promise<RepEvent[]> {
+export async function getRepEvents(fromBlock: bigint, toBlock: bigint): Promise<RepEvent[]> {
   const logs = await publicClient.getLogs({
     address: REP_EMITTER_ADDRESS,
     event: REP_EMITTER_ABI[0],
@@ -226,13 +226,11 @@ export async function getRepEvents(
     toBlock,
   });
 
-  // Fetch block timestamps in parallel (group by unique block numbers to minimise calls).
   const uniqueBlocks = [...new Set(logs.map((l) => l.blockNumber!))];
   const timestamps = new Map<bigint, Date>();
   await Promise.all(
     uniqueBlocks.map(async (bn) => {
-      const ts = await getBlockTimestamp(bn);
-      timestamps.set(bn, ts);
+      timestamps.set(bn, await getBlockTimestamp(bn));
     })
   );
 
@@ -249,17 +247,132 @@ export async function getRepEvents(
 }
 
 // ---------------------------------------------------------------------------
+// ChallengeRegistry events
+// ---------------------------------------------------------------------------
+
+export interface ChallengeSubmittedEvent {
+  challengeId: bigint;
+  challenger: `0x${string}`;
+  epochNumber: bigint;
+  claimedCorrectRoot: `0x${string}`;
+  evidenceHash: `0x${string}`;
+  txHash: `0x${string}`;
+  blockNumber: bigint;
+  blockTimestamp: Date;
+}
+
+export interface ChallengeResolvedEvent {
+  challengeId: bigint;
+  challenger: `0x${string}`;
+  epochNumber?: bigint;
+  status: "accepted" | "rejected";
+  /** Populated for rejected events (from the ChallengeRejected event's reason param). */
+  reason?: string;
+  txHash: `0x${string}`;
+  blockNumber: bigint;
+  blockTimestamp: Date;
+}
+
+export interface AuraBountyGrantedEvent {
+  recipient: `0x${string}`;
+  amount: bigint;
+  challengeId: bigint;
+  txHash: `0x${string}`;
+  blockNumber: bigint;
+  blockTimestamp: Date;
+}
+
+export async function getChallengeRegistryEvents(
+  fromBlock: bigint,
+  toBlock: bigint
+): Promise<{
+  submitted: ChallengeSubmittedEvent[];
+  resolved: ChallengeResolvedEvent[];
+  auraBounties: AuraBountyGrantedEvent[];
+}> {
+  const [submittedLogs, acceptedLogs, rejectedLogs, bountyLogs] = await Promise.all([
+    publicClient.getLogs({ address: CHALLENGE_REGISTRY_ADDRESS, event: CHALLENGE_REGISTRY_ABI[0], fromBlock, toBlock }),
+    publicClient.getLogs({ address: CHALLENGE_REGISTRY_ADDRESS, event: CHALLENGE_REGISTRY_ABI[1], fromBlock, toBlock }),
+    publicClient.getLogs({ address: CHALLENGE_REGISTRY_ADDRESS, event: CHALLENGE_REGISTRY_ABI[2], fromBlock, toBlock }),
+    publicClient.getLogs({ address: CHALLENGE_REGISTRY_ADDRESS, event: CHALLENGE_REGISTRY_ABI[3], fromBlock, toBlock }),
+  ]);
+
+  // Collect all unique block numbers for timestamp resolution.
+  const allLogs = [...submittedLogs, ...acceptedLogs, ...rejectedLogs, ...bountyLogs];
+  const uniqueBlocks = [...new Set(allLogs.map((l) => l.blockNumber!))];
+  const timestamps = new Map<bigint, Date>();
+  await Promise.all(
+    uniqueBlocks.map(async (bn) => {
+      timestamps.set(bn, await getBlockTimestamp(bn));
+    })
+  );
+
+  const submitted: ChallengeSubmittedEvent[] = submittedLogs.map((l) => ({
+    challengeId: l.args.challengeId as bigint,
+    challenger: l.args.challenger as `0x${string}`,
+    epochNumber: l.args.epochNumber as bigint,
+    claimedCorrectRoot: l.args.claimedCorrectRoot as `0x${string}`,
+    evidenceHash: l.args.evidenceHash as `0x${string}`,
+    txHash: l.transactionHash as `0x${string}`,
+    blockNumber: l.blockNumber!,
+    blockTimestamp: timestamps.get(l.blockNumber!)!,
+  }));
+
+  const resolved: ChallengeResolvedEvent[] = [
+    ...acceptedLogs.map((l) => ({
+      challengeId: l.args.challengeId as bigint,
+      challenger: l.args.challenger as `0x${string}`,
+      epochNumber: l.args.epochNumber as bigint,
+      status: "accepted" as const,
+      txHash: l.transactionHash as `0x${string}`,
+      blockNumber: l.blockNumber!,
+      blockTimestamp: timestamps.get(l.blockNumber!)!,
+    })),
+    ...rejectedLogs.map((l) => ({
+      challengeId: l.args.challengeId as bigint,
+      challenger: l.args.challenger as `0x${string}`,
+      status: "rejected" as const,
+      reason: l.args.reason as string,
+      txHash: l.transactionHash as `0x${string}`,
+      blockNumber: l.blockNumber!,
+      blockTimestamp: timestamps.get(l.blockNumber!)!,
+    })),
+  ];
+
+  const auraBounties: AuraBountyGrantedEvent[] = bountyLogs.map((l) => ({
+    recipient: l.args.recipient as `0x${string}`,
+    amount: l.args.amount as bigint,
+    challengeId: l.args.challengeId as bigint,
+    txHash: l.transactionHash as `0x${string}`,
+    blockNumber: l.blockNumber!,
+    blockTimestamp: timestamps.get(l.blockNumber!)!,
+  }));
+
+  return { submitted, resolved, auraBounties };
+}
+
+// ---------------------------------------------------------------------------
 // Root posting
 // ---------------------------------------------------------------------------
 
-export async function postRootOnchain(epoch: bigint, root: `0x${string}`): Promise<`0x${string}`> {
+/**
+ * Post a new Merkle root onchain. `datasetHash` is published alongside the root
+ * so third parties can independently verify the dataset that produced the tree.
+ *
+ * Both `root` and `datasetHash` are 1e18-scale-independent — they're raw bytes32.
+ */
+export async function postRootOnchain(
+  epoch: bigint,
+  root: `0x${string}`,
+  datasetHash: `0x${string}`
+): Promise<`0x${string}`> {
   const hash = await walletClient.writeContract({
     address: ROOT_REGISTRY_ADDRESS,
     abi: ROOT_REGISTRY_ABI,
     functionName: "postRoot",
-    args: [epoch, root as `0x${string}`],
+    args: [epoch, root, datasetHash],
   });
-  console.log(`[blockchain] Root posted: epoch=${epoch} root=${root} tx=${hash}`);
+  console.log(`[blockchain] Root posted: epoch=${epoch} root=${root} datasetHash=${datasetHash} tx=${hash}`);
   return hash;
 }
 

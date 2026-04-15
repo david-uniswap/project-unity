@@ -48,8 +48,8 @@ fi
 
 log "Installing Foundry submodules..."
 cd contracts
-forge install foundry-rs/forge-std --no-commit 2>/dev/null || true
-forge install OpenZeppelin/openzeppelin-contracts@v5.2.0 --no-commit 2>/dev/null || true
+forge install foundry-rs/forge-std 2>/dev/null || true
+forge install OpenZeppelin/openzeppelin-contracts@v5.2.0 2>/dev/null || true
 cd ..
 log "Contract dependencies installed ✓"
 
@@ -95,8 +95,17 @@ if command -v docker &>/dev/null; then
     fi
     sleep 1
   done
+
+  # Apply schema + migrations (all statements use IF NOT EXISTS — safe to re-run).
+  log "Applying DB schema..."
+  docker compose exec -T postgres psql -U unity -d unity < db/schema.sql
+  log "Applying DB migrations..."
+  docker compose exec -T postgres psql -U unity -d unity < db/migrations/002_challenges.sql
+  log "Database schema applied ✓"
 else
-  warn "Docker not found — start Postgres manually and run: psql \$DATABASE_URL -f db/schema.sql"
+  warn "Docker not found — start Postgres manually, then run:"
+  warn "  psql \$DATABASE_URL -f db/schema.sql"
+  warn "  psql \$DATABASE_URL -f db/migrations/002_challenges.sql"
 fi
 
 # ---------------------------------------------------------------------------
@@ -132,4 +141,8 @@ echo "       cd api && bun run dev"
 echo ""
 echo "Or run everything with Docker:"
 echo "  docker compose up"
+echo ""
+echo "For local development (no Sepolia, no testnet tokens):"
+echo "  ./scripts/local-dev.sh"
+echo "  See LOCAL_DEV.md for the full frontend developer guide."
 echo ""

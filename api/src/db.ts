@@ -61,6 +61,9 @@ export async function getRepLeaderboardByCategory(category: number, limit = 50, 
 // ---------------------------------------------------------------------------
 
 export async function getProfileByUsername(username: string) {
+  // Usernames are enforced lowercase-only by the ProfileRegistry contract, so
+  // lowercasing the input here means /api/profiles/Carol resolves to "carol".
+  const lower = username.toLowerCase();
   const rows = await sql`
     SELECT
       p.id,
@@ -79,7 +82,7 @@ export async function getProfileByUsername(username: string) {
       ORDER BY epoch_number DESC
       LIMIT 1
     ) s ON TRUE
-    WHERE p.username = ${username}
+    WHERE p.username = ${lower}
     LIMIT 1
   `;
   return rows[0] ?? null;
@@ -295,4 +298,79 @@ export async function searchProfiles(query: string, limit = 10) {
     ORDER BY username
     LIMIT ${limit}
   `;
+}
+
+// ---------------------------------------------------------------------------
+// Challenges
+// ---------------------------------------------------------------------------
+
+export async function listChallenges(opts: {
+  status?: string;
+  epochNumber?: number;
+  limit?: number;
+  offset?: number;
+}) {
+  const { status, epochNumber, limit = 50, offset = 0 } = opts;
+  return sql`
+    SELECT
+      id,
+      challenger_address  AS "challengerAddress",
+      epoch_number        AS "epochNumber",
+      claimed_correct_root AS "claimedCorrectRoot",
+      evidence_hash       AS "evidenceHash",
+      tx_hash             AS "txHash",
+      block_number        AS "blockNumber",
+      submitted_at        AS "submittedAt",
+      status,
+      resolved_tx_hash    AS "resolvedTxHash",
+      resolved_at         AS "resolvedAt",
+      rejection_reason    AS "rejectionReason",
+      created_at          AS "createdAt"
+    FROM challenges
+    WHERE
+      (${status ?? null}::text IS NULL OR status = ${status ?? ""})
+      AND (${epochNumber ?? null}::bigint IS NULL OR epoch_number = ${epochNumber ?? 0})
+    ORDER BY submitted_at DESC
+    LIMIT ${limit} OFFSET ${offset}
+  `;
+}
+
+export async function getChallengeById(id: number | bigint) {
+  const rows = await sql`
+    SELECT
+      id,
+      challenger_address  AS "challengerAddress",
+      epoch_number        AS "epochNumber",
+      claimed_correct_root AS "claimedCorrectRoot",
+      evidence_hash       AS "evidenceHash",
+      tx_hash             AS "txHash",
+      block_number        AS "blockNumber",
+      submitted_at        AS "submittedAt",
+      status,
+      resolved_tx_hash    AS "resolvedTxHash",
+      resolved_at         AS "resolvedAt",
+      rejection_reason    AS "rejectionReason",
+      created_at          AS "createdAt"
+    FROM challenges
+    WHERE id = ${id.toString()}
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+export async function getEpochChallengeSummary(epochNumber: number) {
+  const rows = await sql`
+    SELECT
+      epoch_number        AS "epochNumber",
+      root,
+      dataset_hash        AS "datasetHash",
+      total_challenges    AS "totalChallenges",
+      pending_challenges  AS "pendingChallenges",
+      accepted_challenges AS "acceptedChallenges",
+      rejected_challenges AS "rejectedChallenges"
+    FROM epoch_challenges
+    WHERE epoch_number = ${epochNumber}
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
 }

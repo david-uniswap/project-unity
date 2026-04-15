@@ -10,6 +10,9 @@ import type {
   RepEvent,
   RepTotals,
   ProfileEpochData,
+  AuraBonus,
+  Challenge,
+  ChallengeStatus,
 } from "./types.ts";
 import { REP_CATEGORIES } from "./types.ts";
 
@@ -138,33 +141,22 @@ export async function getPreviousAuraSnapshot(profileId: number): Promise<{
 export async function insertAuraSnapshots(snapshots: AuraSnapshot[]): Promise<void> {
   if (snapshots.length === 0) return;
 
-  const values = snapshots.map((s) => ({
-    profile_id: s.profileId,
-    epoch_number: s.epochNumber.toString(),
-    aura: s.aura.toString(),
-    uni_balance: s.uniBalance.toString(),
-    lp_balance: s.lpBalance.toString(),
-    effective_balance: s.effectiveBalance.toString(),
-    sale_detected: s.saleDetected,
-  }));
-
-  await sql`
-    INSERT INTO aura_snapshots
-      (profile_id, epoch_number, aura, uni_balance, lp_balance, effective_balance, sale_detected)
-    SELECT
-      v.profile_id::integer,
-      v.epoch_number::bigint,
-      v.aura::numeric,
-      v.uni_balance::numeric,
-      v.lp_balance::numeric,
-      v.effective_balance::numeric,
-      v.sale_detected::boolean
-    FROM json_to_recordset(${JSON.stringify(values)}::json) AS v(
-      profile_id text, epoch_number text, aura text,
-      uni_balance text, lp_balance text, effective_balance text, sale_detected boolean
-    )
-    ON CONFLICT (profile_id, epoch_number) DO NOTHING
-  `;
+  for (const s of snapshots) {
+    await sql`
+      INSERT INTO aura_snapshots
+        (profile_id, epoch_number, aura, uni_balance, lp_balance, effective_balance, sale_detected)
+      VALUES (
+        ${s.profileId},
+        ${s.epochNumber.toString()},
+        ${s.aura.toString()},
+        ${s.uniBalance.toString()},
+        ${s.lpBalance.toString()},
+        ${s.effectiveBalance.toString()},
+        ${s.saleDetected}
+      )
+      ON CONFLICT (profile_id, epoch_number) DO NOTHING
+    `;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +321,92 @@ export async function markRepEventCounted(
     SET counted = ${counted}, rejection_reason = ${reason ?? null}
     WHERE tx_hash = ${txHash.toLowerCase()} AND log_index = ${logIndex}
   `;
+}
+
+// ---------------------------------------------------------------------------
+// Challenges
+// ---------------------------------------------------------------------------
+
+export async function insertChallenge(c: Challenge): Promise<void> {
+  try {
+    await sql`
+      INSERT INTO challenges
+        (id, challenger_address, epoch_number, claimed_correct_root,
+         evidence_hash, tx_hash, block_number, submitted_at, status)
+      VALUES (
+        ${c.id.toString()},
+        ${c.challengerAddress.toLowerCase()},
+        ${c.epochNumber.toString()},
+        ${c.claimedCorrectRoot ?? null},
+        ${c.evidenceHash ?? null},
+        ${c.txHash.toLowerCase()},
+        ${c.blockNumber.toString()},
+        ${c.submittedAt},
+        ${"pending"}
+      )
+      ON CONFLICT (id) DO NOTHING
+    `;
+  } catch (err) {
+    // FK violation if the challenged epoch hasn't been indexed yet — safe to skip.
+    console.warn(`[db] insertChallenge skipped for id=${c.id}: ${err}`);
+  }
+}
+
+export async function updateChallengeStatus(
+  challengeId: bigint,
+  status: ChallengeStatus,
+  resolvedAt: Date,
+  resolvedTxHash: string,
+  rejectionReason?: string
+): Promise<void> {
+  await sql`
+    UPDATE challenges
+    SET
+      status           = ${status},
+      resolved_tx_hash = ${resolvedTxHash.toLowerCase()},
+      resolved_at      = ${resolvedAt},
+      rejection_reason = ${rejectionReason ?? null}
+    WHERE id = ${challengeId.toString()}
+  `;
+}
+
+// ---------------------------------------------------------------------------
+// Aura bonuses (permanent, from challenge rewards)
+// ---------------------------------------------------------------------------
+
+export async function insertAuraBonus(bonus: AuraBonus): Promise<void> {
+  // Resolve profile id from wallet if possible (challenger may not have a profile).
+  const profile = await getProfileByWallet(bonus.walletAddress);
+  try {
+    await sql`
+      INSERT INTO aura_bonuses
+        (profile_id, wallet_address, amount, challenge_id, tx_hash, granted_at)
+      VALUES (
+        ${profile?.id ?? null},
+        ${bonus.walletAddress.toLowerCase()},
+        ${bonus.amount.toString()},
+        ${bonus.challengeId.toString()},
+        ${bonus.txHash.toLowerCase()},
+        ${bonus.grantedAt}
+      )
+      ON CONFLICT (tx_hash) DO NOTHING
+    `;
+  } catch (err) {
+    console.warn(`[db] insertAuraBonus skipped for tx=${bonus.txHash}: ${err}`);
+  }
+}
+
+/**
+ * Sum all permanent bonus Aura for a wallet (1e18-scaled).
+ * Used by aura.ts when building the total Aura for a Merkle leaf.
+ */
+export async function getTotalAuraBonus(walletAddress: string): Promise<bigint> {
+  const rows = await sql`
+    SELECT COALESCE(SUM(amount), 0)::text AS total
+    FROM aura_bonuses
+    WHERE LOWER(wallet_address) = ${walletAddress.toLowerCase()}
+  `;
+  return BigInt(rows[0]?.total ?? "0");
 }
 
 export default sql;

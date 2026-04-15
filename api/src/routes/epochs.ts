@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getCurrentEpoch, getEpochByNumber, listEpochs } from "../db.ts";
+import { getCurrentEpoch, getEpochByNumber, listEpochs, getEpochChallengeSummary } from "../db.ts";
 
 export const epochRoutes = new Hono();
 
@@ -27,4 +27,16 @@ epochRoutes.get("/:number", async (c) => {
   if (!epoch) return c.json({ error: "Epoch not found" }, 404);
 
   return c.json(epoch);
+});
+
+// GET /api/epochs/:number/challenges
+// Returns challenge summary counts (pending/accepted/rejected) for an epoch.
+epochRoutes.get("/:number/challenges", async (c) => {
+  const num = parseInt(c.req.param("number"));
+  if (isNaN(num)) return c.json({ error: "Invalid epoch number" }, 400);
+
+  const summary = await getEpochChallengeSummary(num);
+  if (!summary) return c.json({ error: "Epoch not found" }, 404);
+
+  return c.json(summary);
 });

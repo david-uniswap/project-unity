@@ -32,11 +32,11 @@ export const FAKE_UNI_ADDRESS = require("FAKE_UNI_ADDRESS") as `0x${string}`;
 export const PROFILE_REGISTRY_ADDRESS = require("PROFILE_REGISTRY_ADDRESS") as `0x${string}`;
 export const ROOT_REGISTRY_ADDRESS = require("ROOT_REGISTRY_ADDRESS") as `0x${string}`;
 export const REP_EMITTER_ADDRESS = require("REP_EMITTER_ADDRESS") as `0x${string}`;
+export const CHALLENGE_REGISTRY_ADDRESS = require("CHALLENGE_REGISTRY_ADDRESS") as `0x${string}`;
 
 /**
- * Comma-separated list of approved LP pool addresses eligible for the 2x Aura boost.
+ * Comma-separated list of approved LP pool addresses eligible for the 2× Aura boost.
  * The top 3 deepest UNI/fUNI pools should be listed here.
- * Example: "0xABC...,0xDEF..."
  */
 export const APPROVED_LP_POOLS: `0x${string}`[] = optional("APPROVED_LP_POOLS", "")
   .split(",")
@@ -54,6 +54,18 @@ export const APPROVED_LENDING_CONTRACTS: `0x${string}`[] = optional(
   .split(",")
   .filter(Boolean)
   .map((a) => a.trim() as `0x${string}`);
+
+/**
+ * Protocol-level addresses whose REP events bypass all Aura allowance checks.
+ * The ChallengeRegistry is whitelisted here so it can grant Builder REP to
+ * successful challengers without needing any Aura of its own.
+ */
+export const PROTOCOL_GIVERS: Set<string> = new Set(
+  optional("PROTOCOL_GIVERS", "")
+    .split(",")
+    .filter(Boolean)
+    .map((a) => a.trim().toLowerCase())
+);
 
 // ---------------------------------------------------------------------------
 // Poster credentials
@@ -78,20 +90,30 @@ export const EPOCH_DURATION_MS = parseInt(
 );
 
 /**
- * Aura accrual rate per epoch per unit of UNI (scaled by 1e18).
+ * Aura accrual rate per epoch per unit of UNI, expressed in 1e18-scaled units.
  *
- * Rate = 0.0001 per UNI per day × (10 min / 1440 min/day)
- *       = 0.0001 / 144
- *       = 1e18 / 1_440_000  in scaled integer form
- *       ≈ 694_444_444_444 (per UNI per epoch, 1e18 scale)
+ * All Aura values are 18-decimal fixed-point (identical convention to ERC-20 tokens),
+ * so 1 Aura = 1e18 in uint256 storage — this makes onchain integration and
+ * third-party tooling work without any custom decimal handling.
+ *
+ * Rate = 0.0001 Aura per UNI per day × (10 min / 1440 min/day)
+ *      = 1e18 / 1_440_000
+ *      ≈ 694_444_444_444 (per 1 UNI held per epoch, in 1e18-scaled units)
  */
 export const AURA_RATE_PER_EPOCH: bigint = 1_000_000_000_000_000_000n / 1_440_000n;
 
 /**
  * Minimum Aura (1e18-scaled) a profile must have to have their REP grants counted.
- * 1 Aura = 1_000_000_000_000_000_000n (1e18).
+ * 1 Aura = 1_000_000_000_000_000_000 (1e18).
  */
 export const MIN_AURA_TO_GIVE_REP: bigint = 1_000_000_000_000_000_000n;
 
 /** Block to start scanning events from if no checkpoint exists. */
 export const START_BLOCK = BigInt(optional("START_BLOCK", "0"));
+
+/**
+ * Enable verbose per-event debug logging.
+ * Set DEBUG=true in .env to see per-event validation decisions,
+ * aura computation detail, and blockchain call traces.
+ */
+export const DEBUG = optional("DEBUG", "false") === "true";

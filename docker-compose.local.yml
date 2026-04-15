@@ -1,0 +1,77 @@
+# =============================================================================
+# docker-compose.local.yml — Local development override
+# =============================================================================
+# Adds an Anvil local node and wires the indexer + API to use it instead of Sepolia.
+#
+# Usage (always pair with the base compose file):
+#
+#   # Full local stack (Anvil + Postgres + indexer + API):
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up
+#
+#   # Just the infrastructure (run indexer + API locally with bun):
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up anvil postgres
+#
+# After Anvil starts, deploy contracts:
+#   forge script contracts/script/LocalSetup.s.sol \
+#     --rpc-url http://127.0.0.1:8545 \
+#     --broadcast
+# Then paste the addresses into .env.local and restart the indexer.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Anvil — local EVM node
+  # ---------------------------------------------------------------------------
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    platform: linux/amd64
+    entrypoint: anvil
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--chain-id"
+      - "31337"
+      - "--block-time"    # produce a block every 2 seconds automatically
+      - "2"
+      - "--accounts"
+      - "10"
+      - "--balance"
+      - "10000"
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 > /dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Indexer — override env for local Anvil
+  # ---------------------------------------------------------------------------
+  indexer:
+    depends_on:
+      anvil:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env.local
+    environment:
+      DATABASE_URL: postgres://unity:unity@postgres:5432/unity
+      SEPOLIA_RPC_URL: http://anvil:8545
+      CHAIN_ID: "31337"
+      EPOCH_DURATION_MS: "30000"   # 30-second epochs for fast local iteration
+      START_BLOCK: "0"
+      DEBUG: "true"               # verbose per-event logging
+
+  # ---------------------------------------------------------------------------
+  # API — override env for local Anvil
+  # ---------------------------------------------------------------------------
+  api:
+    depends_on:
+      anvil:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env.local
+    environment:
+      DATABASE_URL: postgres://unity:unity@postgres:5432/unity
+      PORT: "3001"

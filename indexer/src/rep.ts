@@ -2,23 +2,20 @@
  * rep.ts — REP event validation and aggregation.
  *
  * Validation rules (enforced by the indexer, not onchain):
- *  1. Giver must have ≥ 1 Aura (1e18 scaled) in the most recent snapshot.
- *  2. The giver's cumulative abs(REP given) must not exceed their current Aura
- *     (each Aura point can be used to assign REP once, in total across all grants).
- *  3. Self-REP (from == to) is rejected (already blocked onchain, belt-and-suspenders).
+ *  1. Giver must be a registered profile OR a whitelisted protocol address.
+ *  2. Recipient must be a registered profile.
+ *  3. Registered givers must have ≥ 1 Aura (1e18-scaled) in the most recent snapshot.
+ *  4. Registered givers' cumulative abs(REP given) must not exceed their current Aura.
  *
- * REP totals are net values — positive and negative REP stack.
- * Negative REP is how givers offset prior positive grants.
+ * Protocol addresses (e.g. ChallengeRegistry) bypass all Aura/allowance checks.
+ * They are whitelisted in PROTOCOL_GIVERS from config.
+ *
+ * REP totals are net (positive and negative REP stack).
  */
 
-import type {
-  Profile,
-  AuraSnapshot,
-  RepEvent,
-  RepTotals,
-} from "./types.ts";
-import { REP_CATEGORIES, CATEGORY_INDEX } from "./types.ts";
-import { MIN_AURA_TO_GIVE_REP } from "./config.ts";
+import type { Profile, AuraSnapshot, RepEvent, RepTotals } from "./types.ts";
+import { REP_CATEGORIES } from "./types.ts";
+import { MIN_AURA_TO_GIVE_REP, PROTOCOL_GIVERS, DEBUG } from "./config.ts";
 import {
   getRepAllowance,
   upsertRepAllowance,
@@ -30,57 +27,61 @@ import {
 // Validation
 // ---------------------------------------------------------------------------
 
-/**
- * Validate and filter REP events against current Aura state.
- * Returns only the events that should count toward REP totals.
- *
- * @param events        All raw REP events (new events this epoch or full history).
- * @param auraSnapshots Current epoch's Aura snapshots, keyed by primary wallet (lowercase).
- * @param profilesByWallet Map from any wallet address (lowercase) → profile.
- */
 export async function validateAndFilterRepEvents(
   events: RepEvent[],
   auraSnapshots: Map<string, AuraSnapshot>,
   profilesByWallet: Map<string, Profile>
 ): Promise<RepEvent[]> {
-  // We process events chronologically. For each giver, track how much REP they've spent
-  // cumulatively (against their Aura allowance).
-  const repSpentThisRun = new Map<number, bigint>(); // profileId -> abs(REP) spent so far
-
+  const repSpentThisRun = new Map<number, bigint>(); // profileId -> cumulative REP spent
   const accepted: RepEvent[] = [];
 
   for (const event of events) {
     const fromLower = event.fromAddress.toLowerCase();
     const toLower = event.toAddress.toLowerCase();
 
-    // Belt-and-suspenders: reject self-rep.
+    if (DEBUG) {
+      console.log(`[rep] event tx=${event.txHash} li=${event.logIndex} from=${fromLower} to=${toLower} cat=${event.category} amount=${event.amount}`);
+    }
+
+    // Self-rep is always rejected.
     if (fromLower === toLower) {
+      if (DEBUG) console.log(`[rep]   → rejected: self-rep`);
       await markRepEventCounted(event.txHash, event.logIndex, false, "self-rep");
       continue;
     }
 
-    // Resolve giver to a profile.
-    const giverProfile = profilesByWallet.get(fromLower);
-    if (!giverProfile) {
-      await markRepEventCounted(event.txHash, event.logIndex, false, "giver-not-registered");
-      continue;
-    }
-
-    // Resolve recipient to a profile.
+    // Recipient must always be a registered profile.
     const recipientProfile = profilesByWallet.get(toLower);
     if (!recipientProfile) {
+      if (DEBUG) console.log(`[rep]   → rejected: recipient-not-registered`);
       await markRepEventCounted(event.txHash, event.logIndex, false, "recipient-not-registered");
       continue;
     }
 
-    // Get giver's Aura from the most recent snapshot.
+    // Protocol addresses (e.g. ChallengeRegistry granting rewards) bypass all Aura checks.
+    if (PROTOCOL_GIVERS.has(fromLower)) {
+      if (DEBUG) console.log(`[rep]   → accepted: protocol-giver`);
+      await markRepEventCounted(event.txHash, event.logIndex, true, undefined);
+      accepted.push(event);
+      continue;
+    }
+
+    // Regular giver: must be a registered profile.
+    const giverProfile = profilesByWallet.get(fromLower);
+    if (!giverProfile) {
+      if (DEBUG) console.log(`[rep]   → rejected: giver-not-registered`);
+      await markRepEventCounted(event.txHash, event.logIndex, false, "giver-not-registered");
+      continue;
+    }
+
+    // Minimum Aura check (1e18-scaled — 1 Aura = 1e18).
     const giverAura =
       auraSnapshots.get(giverProfile.primaryWallet.toLowerCase())?.aura ??
       auraSnapshots.get(fromLower)?.aura ??
       0n;
 
-    // Minimum Aura check.
     if (giverAura < MIN_AURA_TO_GIVE_REP) {
+      if (DEBUG) console.log(`[rep]   → rejected: insufficient-aura (${giverAura})`);
       await markRepEventCounted(
         event.txHash,
         event.logIndex,
@@ -90,28 +91,31 @@ export async function validateAndFilterRepEvents(
       continue;
     }
 
-    // Allowance check: abs(REP given historically) + abs(this event) ≤ current Aura.
+    // Allowance check: cumulative abs(REP given) ≤ floor(current Aura / 1e18).
+    // The allowance is in whole Aura units; Aura in DB is 1e18-scaled.
     const { repSpent: historicalSpent } = await getRepAllowance(giverProfile.id);
     const runningSpent = repSpentThisRun.get(giverProfile.id) ?? 0n;
     const totalSpent = historicalSpent + runningSpent;
     const eventCost = event.amount < 0n ? -event.amount : event.amount;
+    const auraInWholeUnits = giverAura / 1_000_000_000_000_000_000n;
 
-    if (totalSpent + eventCost > giverAura / 1_000_000_000_000_000_000n) {
-      // giverAura is 1e18-scaled; allowance is integer REP units.
+    if (totalSpent + eventCost > auraInWholeUnits) {
+      if (DEBUG) {
+        console.log(`[rep]   → rejected: allowance-exceeded (aura=${auraInWholeUnits} spent=${totalSpent} cost=${eventCost})`);
+      }
       await markRepEventCounted(
         event.txHash,
         event.logIndex,
         false,
-        `allowance-exceeded:aura=${giverAura},spent=${totalSpent},cost=${eventCost}`
+        `allowance-exceeded:aura=${auraInWholeUnits},spent=${totalSpent},cost=${eventCost}`
       );
       continue;
     }
 
-    // Accept the event.
-    repSpentThisRun.set(
-      giverProfile.id,
-      runningSpent + eventCost
-    );
+    if (DEBUG) {
+      console.log(`[rep]   → accepted (aura=${auraInWholeUnits} spent=${totalSpent}+${eventCost})`);
+    }
+    repSpentThisRun.set(giverProfile.id, runningSpent + eventCost);
     await markRepEventCounted(event.txHash, event.logIndex, true, undefined);
     accepted.push(event);
   }
@@ -123,30 +127,20 @@ export async function validateAndFilterRepEvents(
 // Aggregation
 // ---------------------------------------------------------------------------
 
-/**
- * Given a set of accepted REP events, build the per-profile REP totals.
- * This replaces (not increments) the stored totals — it computes from scratch
- * using all historical accepted events.
- */
 export function aggregateRepTotals(
   acceptedEvents: RepEvent[],
   profiles: Profile[]
 ): RepTotals[] {
-  const profileById = new Map<number, Profile>(profiles.map((p) => [p.id, p]));
   const profileByWallet = buildWalletMap(profiles);
-
-  // Accumulate totals per (profileId, category).
-  const totals = new Map<string, bigint>(); // key: `${profileId}:${category}`
+  const totals = new Map<string, bigint>(); // `${profileId}:${category}`
 
   for (const event of acceptedEvents) {
     const recipient = profileByWallet.get(event.toAddress.toLowerCase());
     if (!recipient) continue;
-
     const key = `${recipient.id}:${event.category}`;
     totals.set(key, (totals.get(key) ?? 0n) + event.amount);
   }
 
-  // Build output objects for every profile (defaulting missing categories to 0).
   return profiles.map((p) => ({
     profileId: p.id,
     research: totals.get(`${p.id}:0`) ?? 0n,
@@ -159,12 +153,9 @@ export function aggregateRepTotals(
 }
 
 // ---------------------------------------------------------------------------
-// REP graph update
+// REP graph
 // ---------------------------------------------------------------------------
 
-/**
- * Recompute and persist the directional REP graph from all accepted events.
- */
 export async function rebuildRepGraph(
   acceptedEvents: RepEvent[],
   profiles: Profile[]
@@ -172,14 +163,12 @@ export async function rebuildRepGraph(
   const profileByWallet = buildWalletMap(profiles);
 
   type GraphKey = string;
-  const graph = new Map<
-    GraphKey,
-    { net: bigint; count: number; lastAt: Date }
-  >();
+  const graph = new Map<GraphKey, { net: bigint; count: number; lastAt: Date }>();
 
   for (const event of acceptedEvents) {
     const giver = profileByWallet.get(event.fromAddress.toLowerCase());
     const recipient = profileByWallet.get(event.toAddress.toLowerCase());
+    // Protocol givers have no profile entry — skip graph edges for them.
     if (!giver || !recipient) continue;
 
     const key = `${giver.id}:${recipient.id}:${event.category}`;
@@ -187,8 +176,7 @@ export async function rebuildRepGraph(
     graph.set(key, {
       net: current.net + event.amount,
       count: current.count + 1,
-      lastAt:
-        event.blockTimestamp > current.lastAt ? event.blockTimestamp : current.lastAt,
+      lastAt: event.blockTimestamp > current.lastAt ? event.blockTimestamp : current.lastAt,
     });
   }
 
@@ -199,22 +187,21 @@ export async function rebuildRepGraph(
 }
 
 // ---------------------------------------------------------------------------
-// Allowance persistence
+// Allowance persistence (regular givers only — protocol givers have no profile)
 // ---------------------------------------------------------------------------
 
-/**
- * Persist updated REP allowances after processing a new batch of events.
- */
 export async function persistRepAllowances(
   acceptedEvents: RepEvent[],
   auraSnapshots: Map<string, AuraSnapshot>,
   profiles: Profile[]
 ): Promise<void> {
   const profileByWallet = buildWalletMap(profiles);
-
-  // Sum abs(amount) per giver from the accepted events.
   const spentThisBatch = new Map<number, bigint>();
+
   for (const event of acceptedEvents) {
+    // Skip protocol givers — they have no profile and no allowance to track.
+    if (PROTOCOL_GIVERS.has(event.fromAddress.toLowerCase())) continue;
+
     const giver = profileByWallet.get(event.fromAddress.toLowerCase());
     if (!giver) continue;
     const cost = event.amount < 0n ? -event.amount : event.amount;

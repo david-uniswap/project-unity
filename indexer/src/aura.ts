@@ -1,21 +1,27 @@
 /**
  * aura.ts — Aura computation for a single epoch.
  *
+ * Aura values use 18-decimal fixed-point (1 Aura = 1e18), matching the ERC-20 token
+ * standard. This makes onchain integration and third-party tooling straightforward.
+ *
+ * Two components contribute to a profile's total Aura:
+ *   1. UNI-derived Aura — accrues each epoch from holdings; resets to 0 on a sale.
+ *   2. Permanent bonus Aura — granted for accepted challenge submissions;
+ *      immune to sale resets and stored separately in aura_bonuses.
+ *
+ * The Merkle leaf encodes total Aura = UNI-derived + bonus.
+ * The aura_snapshots table stores UNI-derived Aura only, to preserve clean
+ * sale-detection continuity across epochs.
+ *
  * Rules:
  *  - Aura accrues at 0.0001 per UNI per day (AURA_RATE_PER_EPOCH per epoch).
  *  - UNI in approved LP positions gets a 2× weighting toward accrual.
- *  - UNI in approved lending/wrapper contracts is NOT treated as a sale,
- *    but also does not contribute to Aura accrual (excluded entirely for now).
- *  - If a profile's effective UNI balance (wallet + LP raw, excluding lending)
- *    drops vs the previous epoch, a sale is detected and Aura resets to 0.
  *  - Transfers between a profile's two linked wallets do NOT trigger a sale.
  */
 
-import {
-  getFakeUNIBalance,
-  getLPUNIBalance,
-} from "./blockchain.ts";
+import { getFakeUNIBalance, getLPUNIBalance } from "./blockchain.ts";
 import { AURA_RATE_PER_EPOCH } from "./config.ts";
+import { getTotalAuraBonus } from "./db.ts";
 import type { Profile, AuraSnapshot, PreviousAura } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -23,8 +29,8 @@ import type { Profile, AuraSnapshot, PreviousAura } from "./types.ts";
 // ---------------------------------------------------------------------------
 
 interface WalletBalances {
-  uniBalance: bigint; // sum of raw fUNI across primary + linked wallets
-  lpBalance: bigint;  // sum of raw UNI in approved LP positions (raw, not 2x)
+  uniBalance: bigint;
+  lpBalance: bigint;
 }
 
 async function fetchBalancesForProfile(profile: Profile): Promise<WalletBalances> {
@@ -48,27 +54,22 @@ async function fetchBalancesForProfile(profile: Profile): Promise<WalletBalances
 
 /**
  * Returns true if the profile appears to have sold UNI since the last epoch.
- *
- * Detection: current effective_balance (uniBalance + lpBalance) < previous effective_balance.
- *
- * Transfers between linked wallets are invisible here because we sum across
- * both wallets before comparing, so intra-profile moves don't register as a drop.
+ * Comparison is on effective_balance (wallet + raw LP) summed across both linked
+ * wallets, so intra-profile transfers are invisible.
  */
 function detectSale(currentEffective: bigint, previous: PreviousAura | null): boolean {
-  if (!previous) return false; // No history — can't detect a sale yet.
+  if (!previous) return false;
   return currentEffective < previous.effectiveBalance;
 }
 
 // ---------------------------------------------------------------------------
-// Aura computation
+// Aura computation (UNI-derived only — no bonus)
 // ---------------------------------------------------------------------------
 
 /**
- * Compute the Aura snapshot for a single profile in the current epoch.
- *
- * @param profile       The profile to compute for.
- * @param epochNumber   Current epoch number.
- * @param previous      Previous epoch's aura state (null on first appearance).
+ * Compute the UNI-derived Aura snapshot for a single profile in the current epoch.
+ * Does NOT include permanent bonus Aura — that is added by the pipeline when building
+ * Merkle leaves, so the DB snapshot stays clean for sale-detection continuity.
  */
 export async function computeAuraSnapshot(
   profile: Profile,
@@ -77,21 +78,17 @@ export async function computeAuraSnapshot(
 ): Promise<AuraSnapshot> {
   const { uniBalance, lpBalance } = await fetchBalancesForProfile(profile);
 
-  // Effective balance for sale detection (raw totals, not 2x).
   const effectiveBalance = uniBalance + lpBalance;
-
   const saleDetected = detectSale(effectiveBalance, previous);
 
-  // Aura-weighted balance applies the 2× LP multiplier.
+  // 2× LP multiplier for Aura accrual.
   const auraWeightedBalance = uniBalance + lpBalance * 2n;
 
-  // Aura calculation:
-  //  - Reset to 0 on sale.
-  //  - Otherwise: previous Aura + (auraWeightedBalance × rate per epoch).
-  //    rate per epoch = AURA_RATE_PER_EPOCH (1e18-scaled per unit of UNI, where UNI is in wei).
-  //    UNI is stored in wei (1 UNI = 1e18 wei), so:
-  //      increment = (auraWeightedBalance * AURA_RATE_PER_EPOCH) / 1e18
-  //                = auraWeightedBalance * AURA_RATE_PER_EPOCH / 1e18
+  // UNI-derived Aura:
+  //   increment = (auraWeightedBalance × AURA_RATE_PER_EPOCH) / 1e18
+  //
+  // UNI is wei-scaled (1 UNI = 1e18) and AURA_RATE_PER_EPOCH is also 1e18-scaled,
+  // so dividing by 1e18 yields an Aura increment in 1e18-scaled units.
   let newAura: bigint;
   if (saleDetected) {
     newAura = 0n;
@@ -105,7 +102,7 @@ export async function computeAuraSnapshot(
   return {
     profileId: profile.id,
     epochNumber,
-    aura: newAura,
+    aura: newAura,       // UNI-derived only — bonuses added separately in pipeline
     uniBalance,
     lpBalance,
     effectiveBalance,
@@ -113,9 +110,31 @@ export async function computeAuraSnapshot(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Total Aura for Merkle leaf (UNI-derived + permanent bonus)
+// ---------------------------------------------------------------------------
+
 /**
- * Compute Aura snapshots for all profiles in parallel (batched to avoid RPC rate limits).
+ * Returns the total Aura to encode in the Merkle leaf for a profile.
+ * = UNI-derived Aura (from snapshot) + permanent bonus Aura (from aura_bonuses table).
+ *
+ * Bonus Aura:
+ *  - Is 1e18-scaled (1 000e18 = 1 000 Aura), same convention as UNI-derived Aura.
+ *  - Is NOT reset on UNI sales.
+ *  - Is credited to the primary wallet used at the time of the challenge.
  */
+export async function getTotalAuraForLeaf(
+  profile: Profile,
+  uniDerivedAura: bigint
+): Promise<bigint> {
+  const bonus = await getTotalAuraBonus(profile.primaryWallet);
+  return uniDerivedAura + bonus;
+}
+
+// ---------------------------------------------------------------------------
+// Batch computation
+// ---------------------------------------------------------------------------
+
 export async function computeAllAuraSnapshots(
   profiles: Profile[],
   epochNumber: bigint,
@@ -127,11 +146,12 @@ export async function computeAllAuraSnapshots(
   for (let i = 0; i < profiles.length; i += BATCH_SIZE) {
     const batch = profiles.slice(i, i + BATCH_SIZE);
     const batchResults = await Promise.all(
-      batch.map((p) => computeAuraSnapshot(p, epochNumber, previousAuras.get(p.id) ?? null))
+      batch.map((p) =>
+        computeAuraSnapshot(p, epochNumber, previousAuras.get(p.id) ?? null)
+      )
     );
     results.push(...batchResults);
     if (i + BATCH_SIZE < profiles.length) {
-      // Small delay between batches to respect RPC rate limits.
       await new Promise((r) => setTimeout(r, 200));
     }
   }

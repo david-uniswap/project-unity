@@ -13,13 +13,37 @@
 import { mkdir } from "node:fs/promises";
 import { runPipeline } from "./pipeline.ts";
 import { getState, setState } from "./db.ts";
+import { getCurrentEpochOnchain } from "./blockchain.ts";
 import { EPOCH_DURATION_MS } from "./config.ts";
 
 const RUN_ONCE = process.argv.includes("--once");
 
+/**
+ * Determine the next epoch to process by reconciling DB state with onchain state.
+ *
+ * If the onchain epoch is ahead of the DB (e.g. the pipeline posted a root but
+ * crashed before persisting the epoch to the DB), we skip to onchain + 1 so we
+ * don't try to re-post an epoch the contract already has.
+ */
 async function getNextEpochNumber(): Promise<bigint> {
-  const last = await getState("last_epoch");
-  return BigInt(last ?? "0") + 1n;
+  const dbLast = BigInt((await getState("last_epoch")) ?? "0");
+  let onchainLast: bigint;
+  try {
+    onchainLast = await getCurrentEpochOnchain();
+  } catch {
+    onchainLast = 0n;
+  }
+
+  if (onchainLast > dbLast) {
+    console.log(
+      `[indexer] Reconciling: DB last_epoch=${dbLast}, onchain currentEpoch=${onchainLast}. ` +
+        `Advancing DB to match onchain.`
+    );
+    await setState("last_epoch", onchainLast.toString());
+  }
+
+  const last = dbLast > onchainLast ? dbLast : onchainLast;
+  return last + 1n;
 }
 
 async function main() {

@@ -18,6 +18,7 @@ contract FakeUNI is ERC20, Ownable {
 
     error FaucetCooldownActive(uint256 nextAvailableAt);
     error FaucetAmountTooHigh(uint256 requested, uint256 max);
+    error ZeroAmount();
 
     constructor(address initialOwner) ERC20("Fake UNI", "fUNI") Ownable(initialOwner) {
         // Mint 1 000 000 fUNI to deployer for seeding liquidity / tests.
@@ -31,6 +32,7 @@ contract FakeUNI is ERC20, Ownable {
 
     /// @notice Public faucet — anyone can call, up to FAUCET_MAX per FAUCET_COOLDOWN window.
     function faucet(uint256 amount) external {
+        if (amount == 0) revert ZeroAmount();
         if (amount > FAUCET_MAX) revert FaucetAmountTooHigh(amount, FAUCET_MAX);
         uint256 next = lastFaucetTime[msg.sender] + FAUCET_COOLDOWN;
         if (block.timestamp < next) revert FaucetCooldownActive(next);

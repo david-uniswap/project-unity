@@ -73,6 +73,21 @@ contract ProfileRegistryTest is Test {
         registry.registerName("Alice");
     }
 
+    function test_registerName_revertWhen_mixedCase() public {
+        // Usernames are lowercase-only — "Carol" and "carol" are NOT the same name
+        // because "Carol" cannot be registered. The contract enforces lowercase at
+        // the source so case ambiguity is impossible at any layer.
+        vm.prank(alice);
+        vm.expectRevert(ProfileRegistry.InvalidName.selector);
+        registry.registerName("Carol");
+    }
+
+    function test_registerName_revertWhen_allUppercase() public {
+        vm.prank(alice);
+        vm.expectRevert(ProfileRegistry.InvalidName.selector);
+        registry.registerName("CAROL");
+    }
+
     function test_registerName_revertWhen_hyphen() public {
         vm.prank(alice);
         vm.expectRevert(ProfileRegistry.InvalidName.selector);
@@ -177,6 +192,41 @@ contract ProfileRegistryTest is Test {
         vm.prank(alice);
         vm.expectRevert(ProfileRegistry.NoLinkedWallet.selector);
         registry.unlinkWallet();
+    }
+
+    function test_linkWallet_canRelinkAfterUnlink() public {
+        vm.prank(alice);
+        registry.registerName("alice");
+
+        vm.prank(alice);
+        registry.linkWallet(bob);
+
+        vm.prank(alice);
+        registry.unlinkWallet();
+
+        // After unlinking bob, alice can link carol.
+        vm.prank(alice);
+        registry.linkWallet(carol);
+
+        (, address linked,) = registry.getProfile(alice);
+        assertEq(linked, carol);
+        assertEq(registry.linkedToPrimary(bob), address(0));
+        assertEq(registry.linkedToPrimary(carol), alice);
+    }
+
+    function test_linkWallet_revertWhen_targetAlreadyLinkedElsewhere() public {
+        // alice links bob.
+        vm.prank(alice);
+        registry.registerName("alice");
+        vm.prank(alice);
+        registry.linkWallet(bob);
+
+        // carol tries to link bob — bob is already linked to alice.
+        vm.prank(carol);
+        registry.registerName("carol");
+        vm.prank(carol);
+        vm.expectRevert(ProfileRegistry.WalletAlreadyLinked.selector);
+        registry.linkWallet(bob);
     }
 
     // -------------------------------------------------------------------------

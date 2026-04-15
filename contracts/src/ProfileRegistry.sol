@@ -51,6 +51,7 @@ contract ProfileRegistry {
     error WalletIsAlreadyPrimary();
     error NoLinkedWallet();
     error Unauthorized();
+    error ZeroAddress();
 
     // -------------------------------------------------------------------------
     // External functions
@@ -77,6 +78,7 @@ contract ProfileRegistry {
     ///         The linked wallet must not have its own username or already be linked elsewhere.
     /// @param wallet  The secondary wallet address to link.
     function linkWallet(address wallet) external {
+        if (wallet == address(0)) revert ZeroAddress();
         if (bytes(_profiles[msg.sender].username).length == 0) revert NotRegistered();
         if (_profiles[msg.sender].linkedWallet != address(0)) revert WalletAlreadyLinked();
         if (wallet == msg.sender) revert CannotLinkSelf();

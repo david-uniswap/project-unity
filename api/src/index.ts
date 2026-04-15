@@ -17,6 +17,9 @@
  *   GET /api/epochs/:number
  *   GET /api/rep/events
  *   GET /api/rep/graph
+ *   GET /api/challenges
+ *   GET /api/challenges/:id
+ *   GET /api/epochs/:number/challenges
  *   GET /api/health
  */
 
@@ -28,6 +31,7 @@ import { leaderboardRoutes } from "./routes/leaderboard.ts";
 import { profileRoutes } from "./routes/profiles.ts";
 import { epochRoutes } from "./routes/epochs.ts";
 import { repRoutes } from "./routes/rep.ts";
+import { challengeRoutes } from "./routes/challenges.ts";
 import { sql } from "./db.ts";
 
 const app = new Hono();
@@ -69,6 +73,7 @@ app.route("/api/leaderboard", leaderboardRoutes);
 app.route("/api/profiles", profileRoutes);
 app.route("/api/epochs", epochRoutes);
 app.route("/api/rep", repRoutes);
+app.route("/api/challenges", challengeRoutes);
 
 // ---------------------------------------------------------------------------
 // 404 fallback

@@ -3,20 +3,27 @@
  *
  * Runs once per epoch (every 10 minutes by default):
  *  1.  Ingest new ProfileRegistry events → sync profiles to DB.
- *  2.  Read current UNI + LP balances for all profiles.
- *  3.  Compute Aura (with sale detection, LP 2× boost).
- *  4.  Ingest new RepEmitter events → store in DB.
- *  5.  Validate REP events against Aura allowances.
- *  6.  Aggregate REP totals per profile per category.
- *  7.  Build Merkle tree across all profiles.
- *  8.  Post root onchain.
- *  9.  Persist snapshots, proofs, and graph to DB.
- * 10.  Output dataset JSON and hashes.
+ *  2.  Ingest new ChallengeRegistry events → sync challenges + Aura bonuses to DB.
+ *  3.  Read current UNI + LP balances for all profiles.
+ *  4.  Compute Aura (with sale detection, LP 2× boost).
+ *  5.  Ingest new RepEmitter events → store in DB.
+ *  6.  Validate REP events against Aura allowances.
+ *  7.  Aggregate REP totals per profile per category.
+ *  8.  Build Merkle tree (leaf Aura = UNI-derived + permanent bonus).
+ *  9.  Post root onchain (with datasetHash for third-party verification).
+ * 10.  Persist snapshots, proofs, and graph to DB.
+ * 11.  Output dataset JSON artifact.
  */
 
 import { writeFile } from "node:fs/promises";
 import { keccak256 } from "viem";
-import { getCurrentBlock, getProfileRegistryEvents, getRepEvents, postRootOnchain } from "./blockchain.ts";
+import {
+  getCurrentBlock,
+  getProfileRegistryEvents,
+  getRepEvents,
+  getChallengeRegistryEvents,
+  postRootOnchain,
+} from "./blockchain.ts";
 import {
   getAllProfiles,
   getLastProcessedBlock,
@@ -25,13 +32,16 @@ import {
   insertAuraSnapshots,
   insertEpoch,
   insertRepEvents,
+  insertChallenge,
+  updateChallengeStatus,
+  insertAuraBonus,
   setState,
   upsertMerkleProof,
   upsertProfile,
   upsertRepTotals,
   updateLinkedWallet,
 } from "./db.ts";
-import { computeAllAuraSnapshots } from "./aura.ts";
+import { computeAllAuraSnapshots, getTotalAuraForLeaf } from "./aura.ts";
 import {
   validateAndFilterRepEvents,
   aggregateRepTotals,
@@ -42,6 +52,7 @@ import {
   buildLeaf,
   buildMerkleTree,
   computeDatasetHash,
+  dumpMerkleTree,
   extractProofsForAllProfiles,
 } from "./merkle.ts";
 import type { Profile, AuraSnapshot, PreviousAura, RepTotals } from "./types.ts";
@@ -82,7 +93,54 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     }
   }
 
-  // ─── Step 2: Load all profiles ───────────────────────────────────────────
+  // ─── Step 2: Ingest ChallengeRegistry events ─────────────────────────────
+
+  if (currentBlock > lastBlock) {
+    const { submitted, resolved, auraBounties } = await getChallengeRegistryEvents(
+      lastBlock + 1n,
+      currentBlock
+    );
+
+    console.log(
+      `[pipeline] ChallengeRegistry: +${submitted.length} submitted, ${resolved.length} resolved, ${auraBounties.length} bounties`
+    );
+
+    for (const ev of submitted) {
+      await insertChallenge({
+        id: ev.challengeId,
+        challengerAddress: ev.challenger,
+        epochNumber: ev.epochNumber,
+        claimedCorrectRoot: ev.claimedCorrectRoot,
+        evidenceHash: ev.evidenceHash,
+        txHash: ev.txHash,
+        blockNumber: ev.blockNumber,
+        submittedAt: ev.blockTimestamp,
+        status: "pending",
+      });
+    }
+
+    for (const ev of resolved) {
+      await updateChallengeStatus(
+        ev.challengeId,
+        ev.status,
+        ev.blockTimestamp,
+        ev.txHash,
+        ev.reason
+      );
+    }
+
+    for (const ev of auraBounties) {
+      await insertAuraBonus({
+        walletAddress: ev.recipient,
+        amount: ev.amount,
+        challengeId: ev.challengeId,
+        txHash: ev.txHash,
+        grantedAt: ev.blockTimestamp,
+      });
+    }
+  }
+
+  // ─── Step 3: Load all profiles ───────────────────────────────────────────
 
   const profiles = await getAllProfiles();
   console.log(`[pipeline] Profiles: ${profiles.length}`);
@@ -93,7 +151,7 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     return;
   }
 
-  // ─── Step 3: Compute Aura ────────────────────────────────────────────────
+  // ─── Step 4: Compute Aura ────────────────────────────────────────────────
 
   // Load previous aura snapshots in parallel.
   const previousAuras = new Map<number, PreviousAura>();
@@ -109,7 +167,8 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     `[pipeline] Aura computed. Sales detected: ${auraSnapshots.filter((s) => s.saleDetected).length}`
   );
 
-  // Build a by-wallet lookup for REP validation.
+  // Build a by-wallet lookup for REP validation (UNI-derived Aura only — bonuses
+  // don't affect the REP allowance check, which uses snapshot.aura).
   const auraByWallet = new Map<string, AuraSnapshot>();
   for (const [i, snapshot] of auraSnapshots.entries()) {
     const profile = profiles[i]!;
@@ -119,7 +178,7 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     }
   }
 
-  // ─── Step 4: Ingest REP events ───────────────────────────────────────────
+  // ─── Step 5: Ingest REP events ───────────────────────────────────────────
 
   if (currentBlock > lastBlock) {
     const newRepEvents = await getRepEvents(lastBlock + 1n, currentBlock);
@@ -127,7 +186,7 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     await insertRepEvents(newRepEvents);
   }
 
-  // ─── Step 5: Validate REP events ─────────────────────────────────────────
+  // ─── Step 6: Validate REP events ─────────────────────────────────────────
 
   const allRepEvents = await getAllRepEvents();
 
@@ -146,7 +205,7 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     `[pipeline] REP events: ${allRepEvents.length} total, ${acceptedEvents.length} accepted`
   );
 
-  // ─── Step 6: Aggregate REP totals ────────────────────────────────────────
+  // ─── Step 7: Aggregate REP totals ────────────────────────────────────────
 
   const repTotalsList = aggregateRepTotals(acceptedEvents, profiles);
   await upsertRepTotals(repTotalsList);
@@ -155,33 +214,41 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
     repTotalsList.map((t) => [t.profileId, t])
   );
 
-  // ─── Step 7: Build Merkle tree ───────────────────────────────────────────
+  // ─── Step 8: Build Merkle tree ───────────────────────────────────────────
+  //
+  // Each leaf uses TOTAL Aura = UNI-derived (from snapshot) + permanent bonus
+  // (from aura_bonuses table). Bonuses are not reset on UNI sales.
 
-  const leaves = profiles.map((profile, i) => {
-    const snapshot = auraSnapshots[i]!;
-    const totals = repTotalsMap.get(profile.id) ?? {
-      profileId: profile.id,
-      research: 0n,
-      builder: 0n,
-      trader: 0n,
-      liquidity: 0n,
-      governance: 0n,
-      community: 0n,
-    };
-    return buildLeaf(epochNumber, profile, snapshot.aura, totals);
-  });
+  const leaves = await Promise.all(
+    profiles.map(async (profile, i) => {
+      const snapshot = auraSnapshots[i]!;
+      const totals = repTotalsMap.get(profile.id) ?? {
+        profileId: profile.id,
+        research: 0n,
+        builder: 0n,
+        trader: 0n,
+        liquidity: 0n,
+        governance: 0n,
+        community: 0n,
+      };
+      const totalAura = await getTotalAuraForLeaf(profile, snapshot.aura);
+      return buildLeaf(epochNumber, profile, totalAura, totals);
+    })
+  );
 
   const merkleOutput = buildMerkleTree(leaves);
   console.log(`[pipeline] Merkle root: ${merkleOutput.root} (${leaves.length} leaves)`);
 
-  // ─── Step 8: Post root onchain ───────────────────────────────────────────
+  // ─── Step 9: Post root onchain ───────────────────────────────────────────
 
   const datasetHash = computeDatasetHash(leaves);
   const configHash = computeConfigHash(epochNumber);
 
-  await postRootOnchain(epochNumber, merkleOutput.root);
+  // datasetHash is posted alongside the root so third parties can independently
+  // reconstruct and verify the dataset that produced the tree.
+  await postRootOnchain(epochNumber, merkleOutput.root, datasetHash);
 
-  // ─── Step 9: Persist to DB ───────────────────────────────────────────────
+  // ─── Step 10: Persist to DB ──────────────────────────────────────────────
 
   await insertEpoch({
     epochNumber,
@@ -213,7 +280,7 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
   await setState("last_block", currentBlock.toString());
   await setState("last_epoch", epochNumber.toString());
 
-  // ─── Step 10: Output artifacts ───────────────────────────────────────────
+  // ─── Step 11: Output artifacts ───────────────────────────────────────────
 
   const artifact = {
     epoch: epochNumber.toString(),
@@ -240,6 +307,15 @@ export async function runPipeline(epochNumber: bigint): Promise<void> {
   ).catch(() => {
     // artifacts dir may not exist on first run — non-fatal.
   });
+
+  // Save the raw Merkle tree dump. Loadable offline with:
+  //   StandardMerkleTree.load(JSON.parse(fs.readFileSync("merkle-epoch-N.json")))
+  // This lets frontend devs generate proofs without hitting the API.
+  const bigintReplacer = (_: string, v: unknown) => typeof v === "bigint" ? v.toString() : v;
+  await writeFile(
+    `./artifacts/merkle-epoch-${epochNumber}.json`,
+    JSON.stringify(dumpMerkleTree(merkleOutput), bigintReplacer, 2)
+  ).catch(() => {});
 
   const elapsed = Date.now() - startTime;
   console.log(`[pipeline] ✓ Epoch ${epochNumber} complete in ${elapsed}ms`);

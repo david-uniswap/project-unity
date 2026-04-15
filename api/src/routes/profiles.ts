@@ -20,6 +20,19 @@ async function resolveProfile(identifier: string) {
   return getProfileByUsername(identifier);
 }
 
+// Static routes MUST come before parameterized routes — Hono matches top-down,
+// so /:identifier would swallow "/search" if it came first.
+
+// GET /api/profiles/search?q=<query>&limit=10
+profileRoutes.get("/search", async (c) => {
+  const query = c.req.query("q") ?? "";
+  if (query.length < 1) return c.json({ data: [] });
+
+  const limit = Math.min(parseInt(c.req.query("limit") ?? "10"), 50);
+  const results = await searchProfiles(query, limit);
+  return c.json({ data: results });
+});
+
 // GET /api/profiles/:identifier
 // :identifier = username or wallet address (0x...)
 profileRoutes.get("/:identifier", async (c) => {
@@ -78,14 +91,4 @@ profileRoutes.get("/:identifier/proof", async (c) => {
     leaf: proof.leaf,
     proof: proof.proof,
   });
-});
-
-// GET /api/profiles/search?q=<query>&limit=10
-profileRoutes.get("/search", async (c) => {
-  const query = c.req.query("q") ?? "";
-  if (query.length < 1) return c.json({ data: [] });
-
-  const limit = Math.min(parseInt(c.req.query("limit") ?? "10"), 50);
-  const results = await searchProfiles(query, limit);
-  return c.json({ data: results });
 });
