@@ -1,10 +1,12 @@
 /**
  * ecosystem-activity.ts — Background script that simulates realistic onchain activity
- * from 20 ecosystem wallets (address indices 10–29 from the Anvil test mnemonic).
+ * from 24 wallets: 4 dev wallets (alice, bob, carol, dave) + 20 ecosystem wallets
+ * (address indices 10–29 from the Anvil test mnemonic).
  *
  * Every 60 seconds a "round" executes:
- *  - 3–6 fUNI transfers between random ecosystem wallets
- *  - 3–5 giveRep calls (RepEmitter) between random ecosystem wallets
+ *  - 3–6 fUNI transfers between random wallets
+ *  - REP events covering all 6 categories (2–4 events per category, 12–24 total)
+ *    using all wallets so every leaderboard category has real values
  *
  * All transactions are sent sequentially to avoid nonce conflicts. Errors from
  * individual transactions (insufficient balance, gas estimation failures, etc.)
@@ -28,7 +30,7 @@ import {
   defineChain,
 } from "viem"
 import { sepolia, anvil } from "viem/chains"
-import { mnemonicToAccount } from "viem/accounts"
+import { mnemonicToAccount, privateKeyToAccount } from "viem/accounts"
 
 // ---------------------------------------------------------------------------
 // Configuration (read directly — this script runs standalone, not via config.ts
@@ -97,33 +99,44 @@ function resolveChain() {
 const chain = resolveChain()
 
 // ---------------------------------------------------------------------------
-// Ecosystem wallet setup
+// Wallet setup — dev wallets (accounts #0-3) + ecosystem wallets (#10-29)
 // ---------------------------------------------------------------------------
 
-/** Zero-padded label for ecosystem wallet at slot i (0-based). */
-function walletLabel(i: number): string {
-  return `eco${String(i + 1).padStart(2, "0")}`
-}
+/** Anvil default private keys for dev wallets (accounts #0-3). Public, local only. */
+const DEV_KEYS = {
+  alice: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+  bob: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+  carol: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+  dave: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+} as const
 
-interface EcosystemWallet {
+interface SimWallet {
   label: string
-  account: ReturnType<typeof mnemonicToAccount>
+  account: ReturnType<typeof mnemonicToAccount> | ReturnType<typeof privateKeyToAccount>
   address: `0x${string}`
 }
 
-/** Derive 20 wallets from address indices 10–29. */
-function buildEcosystemWallets(): EcosystemWallet[] {
-  return Array.from({ length: 20 }, (_, i) => {
+function buildAllWallets(): SimWallet[] {
+  // Dev wallets (accounts #0-3)
+  const devWallets: SimWallet[] = Object.entries(DEV_KEYS).map(([label, key]) => {
+    const account = privateKeyToAccount(key as `0x${string}`)
+    return { label, account, address: account.address }
+  })
+
+  // Ecosystem wallets (accounts #10-29)
+  const ecoWallets: SimWallet[] = Array.from({ length: 20 }, (_, i) => {
     const account = mnemonicToAccount(ANVIL_MNEMONIC, { addressIndex: i + 10 })
     return {
-      label: walletLabel(i),
+      label: `eco${String(i + 1).padStart(2, "0")}`,
       account,
       address: account.address,
     }
   })
+
+  return [...devWallets, ...ecoWallets]
 }
 
-const ecosystemWallets = buildEcosystemWallets()
+const allWallets = buildAllWallets()
 
 // ---------------------------------------------------------------------------
 // viem clients
@@ -135,10 +148,10 @@ const publicClient = createPublicClient({
 })
 
 /**
- * Create a wallet client for the given ecosystem wallet.
+ * Create a wallet client for the given wallet.
  * Each account needs its own client so viem can sign transactions correctly.
  */
-function makeWalletClient(wallet: EcosystemWallet) {
+function makeWalletClient(wallet: SimWallet) {
   return createWalletClient({
     account: wallet.account,
     chain,
@@ -175,8 +188,8 @@ function pickDistinctPair(length: number): [number, number] {
  * Reads the sender's live balance and silently skips if insufficient.
  */
 async function attemptTransfer(fromIdx: number, toIdx: number, amount: bigint): Promise<void> {
-  const sender = ecosystemWallets[fromIdx]
-  const recipient = ecosystemWallets[toIdx]
+  const sender = allWallets[fromIdx]
+  const recipient = allWallets[toIdx]
 
   const balance = await publicClient.readContract({
     address: FAKE_UNI_ADDRESS,
@@ -212,8 +225,8 @@ async function attemptGiveRep(
   category: number,
   amount: number
 ): Promise<void> {
-  const sender = ecosystemWallets[fromIdx]
-  const recipient = ecosystemWallets[toIdx]
+  const sender = allWallets[fromIdx]
+  const recipient = allWallets[toIdx]
 
   const wc = makeWalletClient(sender)
   const hash = await wc.writeContract({
@@ -235,7 +248,7 @@ async function attemptGiveRep(
 /**
  * Execute one round of ecosystem activity:
  *  - 3–6 random fUNI transfers
- *  - 3–5 random REP events
+ *  - REP events covering all 6 categories (2–4 events per category, 12–24 total)
  *
  * All transactions run sequentially to avoid nonce conflicts. Individual errors
  * are caught and logged without aborting the round.
@@ -244,33 +257,35 @@ async function runRound(round: number): Promise<void> {
   console.log(`[ecosystem] --- round ${round} ---`)
 
   const transferCount = randInt(3, 6)
-  const repCount = randInt(3, 5)
 
   // fUNI transfers
   for (let i = 0; i < transferCount; i++) {
-    const [fromIdx, toIdx] = pickDistinctPair(ecosystemWallets.length)
+    const [fromIdx, toIdx] = pickDistinctPair(allWallets.length)
     // Random amount between 1,000 and 500,000 fUNI (whole numbers for readability)
     const fUNIAmount = parseEther(String(randInt(1_000, 500_000)))
     try {
       await attemptTransfer(fromIdx, toIdx, fUNIAmount)
     } catch (err: any) {
       console.warn(
-        `[ecosystem] skipped: fUNI transfer ${ecosystemWallets[fromIdx].label} → ${ecosystemWallets[toIdx].label}: ${err?.shortMessage ?? err?.message ?? "unknown"}`
+        `[ecosystem] skipped: fUNI transfer ${allWallets[fromIdx].label} → ${allWallets[toIdx].label}: ${err?.shortMessage ?? err?.message ?? "unknown"}`
       )
     }
   }
 
-  // REP events
-  for (let i = 0; i < repCount; i++) {
-    const [fromIdx, toIdx] = pickDistinctPair(ecosystemWallets.length)
-    const category = randInt(0, CATEGORY_NAMES.length - 1)
-    const amount = randInt(1, 10)
-    try {
-      await attemptGiveRep(fromIdx, toIdx, category, amount)
-    } catch (err: any) {
-      console.warn(
-        `[ecosystem] skipped: giveRep ${ecosystemWallets[fromIdx].label} → ${ecosystemWallets[toIdx].label}: ${err?.shortMessage ?? err?.message ?? "unknown"}`
-      )
+  // REP events — cover every category each round so all 6 leaderboards populate.
+  // 2–4 events per category with random givers, recipients, and amounts.
+  for (let category = 0; category < CATEGORY_NAMES.length; category++) {
+    const eventsThisCategory = randInt(2, 4)
+    for (let i = 0; i < eventsThisCategory; i++) {
+      const [fromIdx, toIdx] = pickDistinctPair(allWallets.length)
+      const amount = randInt(1, 5)
+      try {
+        await attemptGiveRep(fromIdx, toIdx, category, amount)
+      } catch (err: any) {
+        console.warn(
+          `[ecosystem] skipped: giveRep ${allWallets[fromIdx].label} → ${allWallets[toIdx].label}: ${err?.shortMessage ?? err?.message ?? "unknown"}`
+        )
+      }
     }
   }
 }
@@ -281,8 +296,9 @@ async function runRound(round: number): Promise<void> {
 
 console.log("[ecosystem] Ecosystem activity simulator starting")
 console.log(`[ecosystem] Chain: ${CHAIN_ID}  RPC: ${RPC_URL}`)
+console.log(`[ecosystem] ${allWallets.length} wallets (4 dev + 20 eco), all 6 REP categories per round`)
 console.log("[ecosystem] Wallets:")
-for (const w of ecosystemWallets) {
+for (const w of allWallets) {
   console.log(`[ecosystem]   ${w.label}  ${w.address}`)
 }
 console.log(`[ecosystem] Interval: ${INTERVAL_MS / 1000}s`)
