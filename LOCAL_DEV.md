@@ -318,16 +318,27 @@ tail -f /tmp/unity-indexer.log
 
 ---
 
+## FakeUNI contract address
+
+The FakeUNI token deploys to a **deterministic address** on every fresh Anvil run:
+
+```
+0x700b6A60ce7EaaEA56F065753d8dcB9653dbAD35
+```
+
+This address is stable because Anvil always starts with clean state, and FakeUNI is always the first contract deployed by account #9 (nonce 0). The deploy script asserts this address matches — if deployment order ever changes, the script will fail rather than silently produce a different address.
+
+You can safely hardcode this address in frontend config, test fixtures, or environment files for local development.
+
+---
+
 ## Faucet
 
 Any wallet (including wallets not in this guide) can call the public faucet on the FakeUNI contract to self-mint up to 10 000 fUNI per hour.
 
 ```bash
-# Get the FakeUNI address
-FAKE_UNI=$(grep FAKE_UNI_ADDRESS .env.local | cut -d= -f2)
-
 # Mint 1 000 fUNI to yourself (replace with your address)
-cast send "$FAKE_UNI" "faucet(uint256)" 1000000000000000000000 \
+cast send 0x700b6A60ce7EaaEA56F065753d8dcB9653dbAD35 "faucet(uint256)" 1000000000000000000000 \
   --rpc-url http://127.0.0.1:8545 \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ```
@@ -370,8 +381,8 @@ The indexer hasn't run yet. Wait for the first epoch (~35 seconds) and retry.
 **REP events show `insufficient-aura` in the logs**
 Expected for epoch 1 (no prior snapshot = 0 Aura). Aura appears from epoch 2 onwards and REP events begin counting in epoch 3.
 
-**Anvil resets between restarts (addresses change)**
-Re-run `./scripts/local-dev.sh` — it re-deploys and updates `.env.local` automatically.
+**Anvil resets between restarts**
+Re-run `./scripts/local-dev.sh` — it re-deploys and updates `.env.local` automatically. Contract addresses are deterministic across fresh Anvil runs (same deployer, same nonce order). FakeUNI is always `0x700b6A60ce7EaaEA56F065753d8dcB9653dbAD35`.
 
 **"postRoot reverts"**
 The indexer's POSTER_PRIVATE_KEY must match the poster set in RootRegistry. The startup script ensures this — if you're running manually, verify `.env.local` has the correct key (account #9).

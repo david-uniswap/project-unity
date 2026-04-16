@@ -36,6 +36,14 @@ contract LocalSetup is Script {
     uint256 constant DEPLOYER_KEY = 0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6;
     address constant DEPLOYER = 0xa0Ee7A142d267C1f36714E4a8F75612F20a79720;
 
+    // ── Deterministic contract address ────────────────────────────────────
+    // FakeUNI is always the first CREATE from DEPLOYER (nonce 0) on a fresh
+    // Anvil node, so the address is stable across restarts:
+    //   keccak256(rlp(DEPLOYER, 0)) → 0x700b6A60ce7EaaEA56F065753d8dcB9653dbAD35
+    // If this assertion ever fails, it means deployment order changed — fix
+    // it so FakeUNI stays at nonce 0.
+    address constant EXPECTED_FAKE_UNI = 0x700b6A60ce7EaaEA56F065753d8dcB9653dbAD35;
+
     // ── Dev wallets: Anvil accounts #0-3 ──────────────────────────────────
     uint256 constant ALICE_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
     address constant ALICE = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
@@ -54,6 +62,7 @@ contract LocalSetup is Script {
         vm.startBroadcast(DEPLOYER_KEY);
 
         FakeUNI fakeUni = new FakeUNI(DEPLOYER);
+        require(address(fakeUni) == EXPECTED_FAKE_UNI, "FakeUNI address mismatch - deploy order changed");
         ProfileRegistry profileRegistry = new ProfileRegistry();
         RepEmitter repEmitter = new RepEmitter();
         RootRegistry rootRegistry = new RootRegistry(DEPLOYER); // DEPLOYER is the poster
