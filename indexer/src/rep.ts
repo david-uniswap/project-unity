@@ -17,7 +17,6 @@ import type { Profile, AuraSnapshot, RepEvent, RepTotals } from "./types.ts";
 import { REP_CATEGORIES } from "./types.ts";
 import { MIN_AURA_TO_GIVE_REP, PROTOCOL_GIVERS, DEBUG } from "./config.ts";
 import {
-  getRepAllowance,
   upsertRepAllowance,
   markRepEventCounted,
   upsertRepGraph,
@@ -93,27 +92,28 @@ export async function validateAndFilterRepEvents(
 
     // Allowance check: cumulative abs(REP given) ≤ floor(current Aura / 1e18).
     // The allowance is in whole Aura units; Aura in DB is 1e18-scaled.
-    const { repSpent: historicalSpent } = await getRepAllowance(giverProfile.id);
+    // Since all events are re-validated from scratch each epoch, we only track
+    // repSpentThisRun (this pass's running total) — not the historical DB value,
+    // which would double-count events across epochs.
     const runningSpent = repSpentThisRun.get(giverProfile.id) ?? 0n;
-    const totalSpent = historicalSpent + runningSpent;
     const eventCost = event.amount < 0n ? -event.amount : event.amount;
     const auraInWholeUnits = giverAura / 1_000_000_000_000_000_000n;
 
-    if (totalSpent + eventCost > auraInWholeUnits) {
+    if (runningSpent + eventCost > auraInWholeUnits) {
       if (DEBUG) {
-        console.log(`[rep]   → rejected: allowance-exceeded (aura=${auraInWholeUnits} spent=${totalSpent} cost=${eventCost})`);
+        console.log(`[rep]   → rejected: allowance-exceeded (aura=${auraInWholeUnits} spent=${runningSpent} cost=${eventCost})`);
       }
       await markRepEventCounted(
         event.txHash,
         event.logIndex,
         false,
-        `allowance-exceeded:aura=${auraInWholeUnits},spent=${totalSpent},cost=${eventCost}`
+        `allowance-exceeded:aura=${auraInWholeUnits},spent=${runningSpent},cost=${eventCost}`
       );
       continue;
     }
 
     if (DEBUG) {
-      console.log(`[rep]   → accepted (aura=${auraInWholeUnits} spent=${totalSpent}+${eventCost})`);
+      console.log(`[rep]   → accepted (aura=${auraInWholeUnits} spent=${runningSpent}+${eventCost})`);
     }
     repSpentThisRun.set(giverProfile.id, runningSpent + eventCost);
     await markRepEventCounted(event.txHash, event.logIndex, true, undefined);
@@ -208,13 +208,14 @@ export async function persistRepAllowances(
     spentThisBatch.set(giver.id, (spentThisBatch.get(giver.id) ?? 0n) + cost);
   }
 
-  for (const [profileId, newSpent] of spentThisBatch) {
-    const { repSpent: existing } = await getRepAllowance(profileId);
+  for (const [profileId, totalSpent] of spentThisBatch) {
     const profile = profiles.find((p) => p.id === profileId);
     if (!profile) continue;
     const aura =
       auraSnapshots.get(profile.primaryWallet.toLowerCase())?.aura ?? 0n;
-    await upsertRepAllowance(profileId, aura, existing + newSpent);
+    // SET (not ADD) — all events are re-validated from scratch each epoch,
+    // so totalSpent already represents the full cumulative REP given.
+    await upsertRepAllowance(profileId, aura, totalSpent);
   }
 }
 

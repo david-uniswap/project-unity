@@ -198,17 +198,20 @@ async function attemptTransfer(fromIdx: number, toIdx: number, amount: bigint): 
     args: [sender.address],
   })
 
-  if (balance < amount) return // silently skip — insufficient funds
+  // Cap transfers to 10% of sender's balance per epoch to prevent wild Aura swings.
+  const maxTransfer = balance / 10n
+  if (maxTransfer === 0n) return // nothing to send
+  const cappedAmount = amount > maxTransfer ? maxTransfer : amount
 
   const wc = makeWalletClient(sender)
   const hash = await wc.writeContract({
     address: FAKE_UNI_ADDRESS,
     abi: FAKE_UNI_ABI,
     functionName: "transfer",
-    args: [recipient.address, amount],
+    args: [recipient.address, cappedAmount],
   })
 
-  const displayAmount = Number(formatEther(amount)).toLocaleString("en-US", {
+  const displayAmount = Number(formatEther(cappedAmount)).toLocaleString("en-US", {
     maximumFractionDigits: 1,
   })
   console.log(

@@ -89,13 +89,18 @@ export async function computeAuraSnapshot(
   //
   // UNI is wei-scaled (1 UNI = 1e18) and AURA_RATE_PER_EPOCH is also 1e18-scaled,
   // so dividing by 1e18 yields an Aura increment in 1e18-scaled units.
+  const prevAura = previous?.aura ?? 0n;
+  const increment =
+    (auraWeightedBalance * AURA_RATE_PER_EPOCH) / 1_000_000_000_000_000_000n;
+
   let newAura: bigint;
-  if (saleDetected) {
-    newAura = 0n;
+  if (saleDetected && previous && previous.effectiveBalance > 0n) {
+    // Pro-rata decrease: Aura scales proportionally to balance retention.
+    // E.g. 100 UNI / 1000 Aura → sell 10 UNI → 1000 * 90/100 = 900 Aura.
+    const scaledAura =
+      (prevAura * effectiveBalance) / previous.effectiveBalance;
+    newAura = scaledAura + increment;
   } else {
-    const prevAura = previous?.aura ?? 0n;
-    const increment =
-      (auraWeightedBalance * AURA_RATE_PER_EPOCH) / 1_000_000_000_000_000_000n;
     newAura = prevAura + increment;
   }
 
